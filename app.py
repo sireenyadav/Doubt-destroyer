@@ -76,7 +76,99 @@ def get_comments(video_id, api_key, limit=100):
         while len(comments) < limit:
             request = youtube.commentThreads().list(
                 part="snippet",
-                videoId=video_id,
+def categorize_comments_robust(comments, groq_key):
+    """
+    Upgraded Analyzer: Fixes 'Miscellaneous' bug by being smarter about JSON parsing.
+    """
+    client = Groq(api_key=groq_key)
+    analyzed_results = []
+    
+    batch_size = 10
+    
+    # UI Elements
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    total_batches = len(comments) // batch_size + (1 if len(comments) % batch_size != 0 else 0)
+    
+    for i in range(0, len(comments), batch_size):
+        batch = comments[i:i+batch_size]
+        # We simplify the input to just ID and Text to save tokens
+        batch_text = [{"id": idx, "text": c['text']} for idx, c in enumerate(batch)]
+        
+        # --- IMPROVED PROMPT ---
+        prompt = f"""
+        Classify these comments. 
+        You MUST return a JSON object with a single key "data" containing a list.
+        
+        Categories:
+        - "Doubt" (Questions, confusion, 'how to', 'why', '?')
+        - "Praise" (Good video, thanks, OP, love you)
+        - "Spam" (Attendance, random emojis, dates, self promo)
+        - "Misc" (Anything else)
+
+        Input comments: {json.dumps(batch_text)}
+        
+        REQUIRED OUTPUT FORMAT:
+        {{ "data": [ {{ "id": 0, "category": "Doubt" }}, {{ "id": 1, "category": "Spam" }} ] }}
+        """
+        
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                completion = client.chat.completions.create(
+                    messages=[{"role": "user", "content": prompt}],
+                    model="llama-3.3-70b-versatile",
+                    response_format={"type": "json_object"}
+                )
+                response_content = completion.choices[0].message.content
+                response_data = json.loads(response_content)
+                
+                # --- SMART PARSER (The Fix) ---
+                # It looks for ANY list in the response, not just 'results'
+                results_list = []
+                if "data" in response_data:
+                    results_list = response_data["data"]
+                elif "results" in response_data:
+                    results_list = response_data["results"]
+                else:
+                    # If AI messed up keys, grab the first list we find
+                    for val in response_data.values():
+                        if isinstance(val, list):
+                            results_list = val
+                            break
+                
+                # Map back to original comments
+                if results_list:
+                    for res in results_list:
+                        if res.get("id") is not None and res["id"] < len(batch):
+                            full_comment = batch[res["id"]]
+                            full_comment["category"] = res.get("category", "Misc")
+                            analyzed_results.append(full_comment)
+                    break # Success
+                else:
+                    raise Exception("No list found in AI response")
+
+            except Exception as e:
+                time.sleep(2) # Brief pause before retry
+                if attempt == max_retries - 1:
+                    # Final fail: Mark batch as Misc
+                    for c in batch:
+                        c["category"] = "Misc"
+                        analyzed_results.append(c)
+
+        # Update UI
+        current = (i // batch_size) + 1
+        progress_bar.progress(min(current / total_batches, 1.0))
+        status_text.text(f"Analyzing batch {current}/{total_batches}...")
+        time.sleep(0.5)
+        
+    status_text.success("Analysis Complete!")
+    time.sleep(1)
+    status_text.empty()
+    progress_bar.empty()
+    return analyzed_results
+    videoId=video_id,
                 maxResults=100,
                 pageToken=next_page_token,
                 order="relevance" # Gets top comments first (usually better quality)
@@ -101,88 +193,7 @@ def get_comments(video_id, api_key, limit=100):
         st.error(f"YouTube API Error: {e}")
         return []
 
-def categorize_comments_robust(comments, groq_key):
-    """
-    The 'Unbreakable' Analyzer.
-    Uses Exponential Backoff to handle Groq Rate Limits (Error 429).
-    """
-    client = Groq(api_key=groq_key)
-    analyzed_results = []
-    
-    # Batch size of 10 is safe for Free Tier TPM limits
-    batch_size = 10
-    
-    # UI Elements for Progress
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    total_batches = len(comments) // batch_size + (1 if len(comments) % batch_size != 0 else 0)
-    
-    for i in range(0, len(comments), batch_size):
-        batch = comments[i:i+batch_size]
-        batch_text = [{"id": idx, "text": c['text']} for idx, c in enumerate(batch)]
-        
-        # STRICT PROMPT
-        prompt = f"""
-        You are an Educational Data Analyst. Classify these YouTube comments.
-        
-        CATEGORIES:
-        1. "Doubt": Genuine academic questions, confusion, "why/how", "samajh nahi aaya".
-        2. "Praise": "Best teacher", "Thank you", "Love you", "OP".
-        3. "Spam": "Attendance", "Like if you agree", emojis only, self-promotion.
-        4. "Misc": Everything else.
 
-        Input: {json.dumps(batch_text)}
-        
-        RETURN JSON: {{ "results": [ {{"id": 0, "category": "Doubt"}}, ... ] }}
-        """
-        
-        # RETRY LOGIC (Exponential Backoff)
-        max_retries = 5
-        for attempt in range(max_retries):
-            try:
-                completion = client.chat.completions.create(
-                    messages=[{"role": "user", "content": prompt}],
-                    model="llama-3.3-70b-versatile",
-                    response_format={"type": "json_object"}
-                )
-                response_data = json.loads(completion.choices[0].message.content)
-                
-                if "results" in response_data:
-                    for res in response_data["results"]:
-                        if res["id"] < len(batch):
-                            full_comment = batch[res["id"]]
-                            full_comment["category"] = res["category"]
-                            analyzed_results.append(full_comment)
-                break # Success! Exit retry loop.
-                
-            except Exception as e:
-                error_msg = str(e)
-                # If Rate Limit (429) -> Wait and Retry
-                if "429" in error_msg or "rate limit" in error_msg.lower():
-                    wait_time = (2 ** attempt) + random.uniform(0, 1) # 2s, 4s, 8s...
-                    status_text.warning(f"⚠️ Rate limit hit. Cooling down for {wait_time:.1f}s...")
-                    time.sleep(wait_time)
-                else:
-                    # Other Error -> Skip batch
-                    for c in batch:
-                        c["category"] = "Misc"
-                        analyzed_results.append(c)
-                    break 
-
-        # Update Progress
-        current_batch_num = (i // batch_size) + 1
-        progress_bar.progress(min(current_batch_num / total_batches, 1.0))
-        status_text.text(f"Analyzed {len(analyzed_results)}/{len(comments)} comments...")
-        
-        # Pacing: Sleep 1s to be gentle on the API
-        time.sleep(1)
-        
-    status_text.success("Analysis Complete!")
-    time.sleep(1)
-    status_text.empty() # Clear the status text
-    progress_bar.empty() # Clear the bar
-    return analyzed_results
 
 # --- 5. MAIN DASHBOARD UI ---
 
