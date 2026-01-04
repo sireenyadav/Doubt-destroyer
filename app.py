@@ -1,311 +1,211 @@
 import streamlit as st
 import json
 import time
-import random
+import pandas as pd
 import plotly.express as px
 from googleapiclient.discovery import build
 from groq import Groq
 
-# --- 1. PAGE CONFIGURATION ---
-st.set_page_config(
-    page_title="Doubt Destroyer Pro",
-    page_icon="🎓",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# --- CONFIGURATION ---
+st.set_page_config(page_title="Doubt Destroyer Deep Scan", page_icon="🕵️", layout="wide")
 
-# --- 2. SESSION STATE (Keeps data alive when you click buttons) ---
-if 'data_fetched' not in st.session_state:
-    st.session_state.data_fetched = False
-if 'analyzed_data' not in st.session_state:
-    st.session_state.analyzed_data = []
-if 'video_stats' not in st.session_state:
-    st.session_state.video_stats = {}
+# --- CSS FOR "BEAUTIFUL" UI ---
+st.markdown("""
+<style>
+    .stStatus { border-left: 5px solid #FF4B4B; background-color: #f0f2f6; }
+    div[data-testid="stMetricValue"] { font-size: 24px; }
+</style>
+""", unsafe_allow_html=True)
 
-# --- 3. SIDEBAR CONFIGURATION ---
+# --- SIDEBAR ---
 with st.sidebar:
-    st.title("⚙️ Control Room")
-    st.markdown("Enter your API keys to start the engine.")
+    st.header("🕵️ Deep Scan Setup")
+    st.markdown("Analyze **100%** of the comments on a specific video.")
     
     YOUTUBE_API_KEY = st.text_input("YouTube API Key", type="password")
     GROQ_API_KEY = st.text_input("Groq API Key", type="password")
     
     st.divider()
     
-    # Slider for "Deep Scan" vs "Quick Scan"
-    scan_limit = st.slider(
-        "Comments to Analyze", 
-        min_value=50, 
-        max_value=300, 
-        value=100, 
-        step=50,
-        help="Higher limits take longer. 100 is recommended for Free Tier."
-    )
-    
-    st.info(f"⚡ Est. Processing Time: {scan_limit // 10 * 1.5:.0f} seconds")
+    # User Control
+    max_scan = st.slider("Max Comments Limit", 100, 3000, 500, step=100)
+    st.caption("⚠️ Scanning 1000 comments takes ~2-3 minutes.")
 
-# --- 4. CORE FUNCTIONS ---
+# --- LOGIC ---
 
-def get_video_stats(video_id, api_key):
-    """Fetches Video Metadata (Views, Likes, Channel Name)"""
+def get_video_meta(video_id, key):
+    """Get Thumbnail and Title"""
     try:
-        youtube = build('youtube', 'v3', developerKey=api_key)
-        request = youtube.videos().list(part="snippet,statistics", id=video_id)
-        response = request.execute()
-        if response['items']:
-            item = response['items'][0]
-            return {
-                "title": item['snippet']['title'],
-                "channel": item['snippet']['channelTitle'],
-                "views": int(item['statistics'].get('viewCount', 0)),
-                "likes": int(item['statistics'].get('likeCount', 0)),
-                "comment_count": int(item['statistics'].get('commentCount', 0)),
-                "thumbnail": item['snippet']['thumbnails']['high']['url']
-            }
-    except Exception as e:
-        st.error(f"Error fetching stats: {e}")
-        return None
+        yt = build('youtube', 'v3', developerKey=key)
+        res = yt.videos().list(part="snippet,statistics", id=video_id).execute()
+        return res['items'][0] if res['items'] else None
+    except: return None
 
-def get_comments(video_id, api_key, limit=100):
-    """Fetches comments from YouTube with Pagination"""
-    youtube = build('youtube', 'v3', developerKey=api_key)
-    comments = []
-    next_page_token = None
-    
-    try:
-        while len(comments) < limit:
-            request = youtube.commentThreads().list(
-                part="snippet",
-def categorize_comments_robust(comments, groq_key):
+def deep_analyze(video_id, yt_key, groq_key, limit):
     """
-    Upgraded Analyzer: Fixes 'Miscellaneous' bug by being smarter about JSON parsing.
+    The Core Engine: Fetches & Analyzes in a stream.
+    Includes 'Beautiful Progress' logic.
     """
+    yt = build('youtube', 'v3', developerKey=yt_key)
     client = Groq(api_key=groq_key)
-    analyzed_results = []
     
-    batch_size = 10
+    results = []
+    next_token = None
+    fetched_count = 0
     
-    # UI Elements
-    progress_bar = st.progress(0)
-    status_text = st.empty()
+    # --- BEAUTIFUL PROGRESS CONTAINER ---
+    status = st.status("🚀 Starting Deep Scan...", expanded=True)
+    progress_bar = status.progress(0)
+    log_area = status.empty() # Placeholder for scrolling text
     
-    total_batches = len(comments) // batch_size + (1 if len(comments) % batch_size != 0 else 0)
-    
-    for i in range(0, len(comments), batch_size):
-        batch = comments[i:i+batch_size]
-        # We simplify the input to just ID and Text to save tokens
-        batch_text = [{"id": idx, "text": c['text']} for idx, c in enumerate(batch)]
-        
-        # --- IMPROVED PROMPT ---
-        prompt = f"""
-        Classify these comments. 
-        You MUST return a JSON object with a single key "data" containing a list.
-        
-        Categories:
-        - "Doubt" (Questions, confusion, 'how to', 'why', '?')
-        - "Praise" (Good video, thanks, OP, love you)
-        - "Spam" (Attendance, random emojis, dates, self promo)
-        - "Misc" (Anything else)
-
-        Input comments: {json.dumps(batch_text)}
-        
-        REQUIRED OUTPUT FORMAT:
-        {{ "data": [ {{ "id": 0, "category": "Doubt" }}, {{ "id": 1, "category": "Spam" }} ] }}
-        """
-        
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                completion = client.chat.completions.create(
-                    messages=[{"role": "user", "content": prompt}],
-                    model="llama-3.3-70b-versatile",
-                    response_format={"type": "json_object"}
-                )
-                response_content = completion.choices[0].message.content
-                response_data = json.loads(response_content)
-                
-                # --- SMART PARSER (The Fix) ---
-                # It looks for ANY list in the response, not just 'results'
-                results_list = []
-                if "data" in response_data:
-                    results_list = response_data["data"]
-                elif "results" in response_data:
-                    results_list = response_data["results"]
-                else:
-                    # If AI messed up keys, grab the first list we find
-                    for val in response_data.values():
-                        if isinstance(val, list):
-                            results_list = val
-                            break
-                
-                # Map back to original comments
-                if results_list:
-                    for res in results_list:
-                        if res.get("id") is not None and res["id"] < len(batch):
-                            full_comment = batch[res["id"]]
-                            full_comment["category"] = res.get("category", "Misc")
-                            analyzed_results.append(full_comment)
-                    break # Success
-                else:
-                    raise Exception("No list found in AI response")
-
-            except Exception as e:
-                time.sleep(2) # Brief pause before retry
-                if attempt == max_retries - 1:
-                    # Final fail: Mark batch as Misc
-                    for c in batch:
-                        c["category"] = "Misc"
-                        analyzed_results.append(c)
-
-        # Update UI
-        current = (i // batch_size) + 1
-        progress_bar.progress(min(current / total_batches, 1.0))
-        status_text.text(f"Analyzing batch {current}/{total_batches}...")
-        time.sleep(0.5)
-        
-    status_text.success("Analysis Complete!")
-    time.sleep(1)
-    status_text.empty()
-    progress_bar.empty()
-    return analyzed_results
-    videoId=video_id,
-                maxResults=100,
-                pageToken=next_page_token,
-                order="relevance" # Gets top comments first (usually better quality)
+    try:
+        # 1. LOOP UNTIL LIMIT REACHED
+        while fetched_count < limit:
+            # A. FETCH FROM YOUTUBE
+            log_area.markdown(f"**📥 Fetching comments... ({fetched_count}/{limit})**")
+            req = yt.commentThreads().list(
+                part="snippet", videoId=video_id, maxResults=100, 
+                pageToken=next_token, order="relevance"
             )
-            response = request.execute()
+            res = req.execute()
             
-            for item in response.get('items', []):
+            raw_batch = []
+            for item in res.get('items', []):
                 snippet = item['snippet']['topLevelComment']['snippet']
-                comments.append({
+                raw_batch.append({
                     "author": snippet['authorDisplayName'],
                     "text": snippet['textDisplay'],
                     "likes": snippet['likeCount'],
-                    "published": snippet['publishedAt'][:10]
+                    "date": snippet['publishedAt'][:10]
                 })
             
-            next_page_token = response.get('nextPageToken')
-            if not next_page_token:
-                break 
+            if not raw_batch: break # No more comments
+            fetched_count += len(raw_batch)
+            
+            # B. ANALYZE WITH GROQ (Chunks of 15)
+            chunk_size = 15
+            for i in range(0, len(raw_batch), chunk_size):
+                chunk = raw_batch[i:i+chunk_size]
+                chunk_mini = [{"id": x, "text": c['text']} for x, c in enumerate(chunk)]
                 
-        return comments[:limit]
+                # STRICT PROMPT
+                prompt = f"""
+                Classify these comments for a teacher dashboard.
+                1. "Doubt": MUST be a specific SUBJECT QUESTION (Physics/Math). IGNORE "Batch 2025", "When is class?".
+                2. "Spam": "Attendance", "Like if", "Who is watching", emojis, dates.
+                3. "Praise": "Best teacher", "OP", "Thanks".
+                4. "Misc": Anything else.
+                
+                Input: {json.dumps(chunk_mini)}
+                Return JSON: {{ "data": [ {{ "id": 0, "category": "Doubt" }} ] }}
+                """
+                
+                # RETRY LOGIC (The "Unbreakable" Part)
+                for attempt in range(3):
+                    try:
+                        log_area.markdown(f"🧠 **Analyzing batch...** (Processed {len(results)} comments so far)")
+                        completion = client.chat.completions.create(
+                            messages=[{"role": "user", "content": prompt}],
+                            model="llama-3.3-70b-versatile",
+                            response_format={"type": "json_object"}
+                        )
+                        ai_data = json.loads(completion.choices[0].message.content)
+                        
+                        # Parser
+                        data_list = ai_data.get("data", ai_data.get("results", []))
+                        if not data_list: # Fallback
+                             for v in ai_data.values(): 
+                                 if isinstance(v, list): data_list = v; break
+                        
+                        if data_list:
+                            for d in data_list:
+                                if d.get("id") is not None and d["id"] < len(chunk):
+                                    chunk[d["id"]]["category"] = d.get("category", "Misc")
+                                    results.append(chunk[d["id"]])
+                            break # Success
+                            
+                    except Exception as e:
+                        if "429" in str(e):
+                            wait = (2 ** attempt) + 1
+                            log_area.warning(f"⚠️ API Hot! Cooling down for {wait}s...")
+                            time.sleep(wait)
+                        else:
+                            break 
+                
+                # Update Progress Bar
+                progress_bar.progress(min(fetched_count / limit, 1.0))
+            
+            # Check Next Page
+            next_token = res.get('nextPageToken')
+            if not next_token: break
+            
+        status.update(label="✅ Deep Scan Complete!", state="complete", expanded=False)
+        return results
+
     except Exception as e:
-        st.error(f"YouTube API Error: {e}")
+        status.error(f"Error: {e}")
         return []
 
+# --- MAIN UI ---
+st.title("🎓 Doubt Destroyer: Single Video Deep Scan")
 
-
-# --- 5. MAIN DASHBOARD UI ---
-
-st.title("🎓 Doubt Destroyer")
-st.markdown("### Turn Noise into Knowledge")
-st.markdown("Filter out thousands of *'OP Sir'* comments to find the **10 students who actually need help**.")
-
-# Input Section
+# Input Area
 col1, col2 = st.columns([3, 1])
-with col1:
-    video_url = st.text_input("Paste YouTube Video URL:", placeholder="https://youtu.be/...")
-with col2:
-    analyze_btn = st.button("🚀 Analyze Video", use_container_width=True)
+url = col1.text_input("Paste Video URL:")
+start_btn = col2.button("🚀 Analyze", use_container_width=True)
 
-# LOGIC FLOW
-if analyze_btn:
-    if not video_url or not YOUTUBE_API_KEY or not GROQ_API_KEY:
-        st.error("⚠️ Please enter Video URL and BOTH API Keys in the sidebar.")
-    else:
-        # Smart URL Parsing
-        video_id = None
-        if "youtu.be" in video_url:
-            video_id = video_url.split("/")[-1].split("?")[0]
-        elif "v=" in video_url:
-            video_id = video_url.split("v=")[1].split("&")[0]
+if start_btn and url and YOUTUBE_API_KEY and GROQ_API_KEY:
+    # 1. Parse ID
+    vid_id = url.split("v=")[1].split("&")[0] if "v=" in url else url.split("/")[-1].split("?")[0]
+    
+    # 2. Get Info
+    meta = get_video_meta(vid_id, YOUTUBE_API_KEY)
+    
+    if meta:
+        st.divider()
+        c1, c2 = st.columns([1, 3])
+        c1.image(meta['snippet']['thumbnails']['high']['url'])
+        c2.subheader(meta['snippet']['title'])
+        c2.caption(f"Channel: {meta['snippet']['channelTitle']} | 💬 Total Comments: {meta['statistics']['commentCount']}")
+        
+        # 3. Run Analysis
+        data = deep_analyze(vid_id, YOUTUBE_API_KEY, GROQ_API_KEY, max_scan)
+        
+        # 4. Dashboard
+        if data:
+            df = pd.DataFrame(data)
+            st.divider()
             
-        if video_id:
-            # 1. Fetch Stats
-            st.session_state.video_stats = get_video_stats(video_id, YOUTUBE_API_KEY)
+            # Summary Metrics
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Doubts Found", len(df[df['category'] == 'Doubt']), delta="High Priority")
+            m2.metric("Spam Filtered", len(df[df['category'] == 'Spam']), delta_color="inverse")
+            m3.metric("Praise", len(df[df['category'] == 'Praise']))
             
-            # 2. Fetch Comments
-            with st.spinner(f"📥 Fetching top {scan_limit} comments from YouTube..."):
-                raw_comments = get_comments(video_id, YOUTUBE_API_KEY, limit=scan_limit)
+            # Pie Chart
+            st.subheader("📊 Comment Distribution")
+            fig = px.pie(df, names='category', hole=0.4, color='category',
+                         color_discrete_map={"Doubt":"#ff4b4b", "Praise":"#00cc96", "Spam":"#636efa", "Misc":"#d3d3d3"})
+            st.plotly_chart(fig, use_container_width=True)
             
-            # 3. Analyze with AI
-            if raw_comments:
-                with st.spinner("🧠 AI is separating Doubts from Spam (This may take a moment)..."):
-                    st.session_state.analyzed_data = categorize_comments_robust(raw_comments, GROQ_API_KEY)
-                    st.session_state.data_fetched = True
-            else:
-                st.warning("No comments found or API error.")
+            # Details Tabs
+            tab1, tab2, tab3 = st.tabs(["🔥 Actionable Doubts", "📂 Full Data", "💾 Export"])
+            
+            with tab1:
+                doubts = df[df['category'] == 'Doubt']
+                if doubts.empty:
+                    st.info("No doubts found. The strict filter is working!")
+                for _, row in doubts.iterrows():
+                    with st.expander(f"❓ {row['author']} ({row['date']})"):
+                        st.write(f"**Question:** {row['text']}")
+                        st.button("Draft Reply", key=row['text'][:15])
+                        
+            with tab2:
+                st.dataframe(df)
+                
+            with tab3:
+                csv = df.to_csv(index=False).encode('utf-8')
+                st.download_button("Download CSV Report", csv, "analysis.csv", "text/csv")
         else:
-            st.error("Invalid YouTube URL.")
-
-# --- 6. DISPLAY RESULTS ---
-if st.session_state.data_fetched:
-    stats = st.session_state.video_stats
-    data = st.session_state.analyzed_data
-    
-    # METRICS ROW
-    st.divider()
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Views", f"{stats['views']:,}")
-    c2.metric("Likes", f"{stats['likes']:,}")
-    c3.metric("Total Comments", f"{stats['comment_count']:,}")
-    c4.metric("Scanned", len(data))
-    
-    # CHART ROW
-    st.divider()
-    col_chart, col_thumb = st.columns([2, 1])
-    
-    with col_chart:
-        st.subheader("📊 Comment Distribution")
-        cat_counts = {}
-        for d in data:
-            cat = d.get('category', 'Misc')
-            cat_counts[cat] = cat_counts.get(cat, 0) + 1
-        
-        # Color Map for consistency
-        colors = {"Doubt": "#FF4B4B", "Praise": "#00CC96", "Spam": "#636EFA", "Misc": "#FFA15A"}
-        
-        fig = px.pie(
-            values=list(cat_counts.values()), 
-            names=list(cat_counts.keys()), 
-            hole=0.4,
-            color=list(cat_counts.keys()),
-            color_discrete_map=colors
-        )
-        st.plotly_chart(fig, use_container_width=True)
-        
-    with col_thumb:
-        st.image(stats['thumbnail'], caption=stats['title'], use_column_width=True)
-
-    # TABS SECTION
-    st.divider()
-    tab_doubt, tab_praise, tab_spam, tab_raw = st.tabs(["🔥 ACTIONABLE DOUBTS", "💖 Praise", "🚫 Spam/Engagement", "📂 All Data"])
-    
-    with tab_doubt:
-        doubts = [d for d in data if d['category'] == 'Doubt']
-        if doubts:
-            st.success(f"Found {len(doubts)} High-Value Doubts")
-            for i, d in enumerate(doubts):
-                with st.expander(f"❓ {d['author']}: {d['text'][:60]}..."):
-                    st.write(f"**Full Question:** {d['text']}")
-                    st.caption(f"👍 Likes: {d['likes']} | 📅 {d['published']}")
-                    
-                    # Draft Reply Action
-                    if st.button(f"Draft Reply #{i}"):
-                        st.text_area("AI Draft (Copy this)", value=f"Hello {d['author']}, great question! \n[ AI would generate answer here based on transcript ]\nKeep studying!", height=100)
-        else:
-            st.info("No doubts found in this batch! The students must be geniuses.")
-
-    with tab_praise:
-        praise = [d for d in data if d['category'] == 'Praise']
-        st.info(f"{len(praise)} Positive Comments")
-        st.dataframe(praise, column_config={"author": "Student", "text": "Comment", "likes": "Likes"}, height=300)
-
-    with tab_spam:
-        spam = [d for d in data if d['category'] == 'Spam']
-        st.warning(f"{len(spam)} Spam/Engagement Comments")
-        st.dataframe(spam, column_config={"author": "User", "text": "Spam Content"}, height=300)
+            st.warning("No comments found.")
             
-    with tab_raw:
-        st.dataframe(data)
-              
